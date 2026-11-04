@@ -23,6 +23,7 @@ from typing import TypeVar, Callable
 
 from ..message import constants
 from ..message.commands import *
+from ..message.avp import Avp
 from ..message.avp.grouped import FailedAvp
 from ._helpers import parse_diameter_uri, validate_message_avps
 from ._helpers import SequenceGenerator, SessionGenerator, StoppableThread
@@ -94,6 +95,31 @@ class NodeStats:
 class NotRoutable(NodeError):
     """Error raised when a message can not be routed to any peer."""
     pass
+
+
+@dataclasses.dataclass
+class _RelayedRequest:
+    """Internal bookkeeping for a request forwarded by a relay agent.
+
+    Holds the information required to route the answer from the next-hop
+    peer back towards the original requester, or to produce an error answer
+    when the next hop disappears or fails to answer in time.
+    """
+    requestor_conn: PeerConnection
+    """The connection the original request arrived on."""
+    next_hop_conn: PeerConnection
+    """The connection the request was forwarded to."""
+    original_hop_by_hop: int
+    """Hop-by-hop identifier used by the original requester."""
+    request: Message
+    """The forwarded request instance, as sent to the next hop."""
+    sent_at: float
+    """Timestamp of when the request was forwarded."""
+
+    @property
+    def next_hop_host(self) -> str:
+        return self.next_hop_conn.host_identity
+
 
 
 class StatsLogAdapter(logging.LoggerAdapter):
@@ -242,6 +268,11 @@ class Node:
         # A temporary list of sent end-by-end IDs, stored individually for each
         # origin-host, for retransmission check.
         self._sent_answers: dict[str, deque[int]] = {}
+        # Requests that this node, acting as a relay agent, has forwarded
+        # towards a next-hop peer and is still expecting an answer for. The
+        # dictionary is keyed with the next-hop host identity and the new
+        # hop-by-hop identifier allocated for the forwarded request.
+        self._relay_waiting_answer: dict[tuple[str, int], _RelayedRequest] = {}
 
         self.vendor_ids: set[int] = set(
             vendor_ids or [i for i in constants.VENDORS.keys() if i > 0])
@@ -270,9 +301,18 @@ class Node:
         Will be used if no specific timeout value has been configured for a 
         peer."""
         self.idle_timeout: int = 30
-        """Default time spent idle before a DWR is triggered, in seconds. 
+        """Default time spent idle before a DWR is triggered, in seconds.
         Will be used if no specific timeout value has been configured for a 
         peer."""
+        self.relay_answer_timeout: int = 30
+        """Time in seconds after which a request forwarded by this node acting
+        as a relay agent is considered failed, if no answer has been received
+        from the next-hop peer. A DIAMETER_UNABLE_TO_DELIVER error answer is
+        then returned to the original requester and an answer arriving later
+        than that is no longer forwarded. This value is not dictated by
+        rfc6733; pending requests are checked every `wakeup_interval` seconds,
+        so the actual failure may be observed up to one wakeup interval later.
+        """
         self.wakeup_interval: int = 6
         """Time in seconds between forced wakeups while waiting for connection
         sockets to become active. This timer value controls how often peer 
@@ -365,6 +405,18 @@ class Node:
     def acct_application_ids(self) -> set[int]:
         return set(a.application_id for a in self.applications
                    if a.is_acct_application)
+
+    @property
+    def relay_app(self) -> Application | None:
+        """Return the registered relay application, if this node acts as a
+        relay agent. A node is considered a relay agent whenever an
+        application with the relay application ID (`constants.APP_RELAY`) has
+        been registered with `add_application`.
+        """
+        for app in self.applications:
+            if app.application_id == constants.APP_RELAY:
+                return app
+        return None
 
     def _add_peer_connection(self, conn: PeerConnection,
                              peer_socket: socket.socket | sctp.sctpsocket,
@@ -824,6 +876,7 @@ class Node:
             for conn in list(self.connections.values()):
                 self._check_timers(conn)
 
+            self._check_relay_answer_timeouts()
             self._reconnect_peers()
 
     def _receive_message(self, conn: PeerConnection, msg: _AnyMessageType):
@@ -958,6 +1011,11 @@ class Node:
             receiving_app.receive_request(message)
             return
 
+        relay_app = self.relay_app
+        if relay_app is not None:
+            self._relay_request(conn, message, relay_app)
+            return
+
         self.logger.warning(
             f"{conn} no application ID {app_id} present to receive request "
             f"{hex(message.header.hop_by_hop_identifier)}")
@@ -965,6 +1023,217 @@ class Node:
         err = self._generate_answer(conn, message)
         err.result_code = constants.E_RESULT_CODE_DIAMETER_APPLICATION_UNSUPPORTED
         self.send_message(conn, err)
+
+    def _relay_request(self, conn: PeerConnection, message: _AnyMessageType,
+                       relay_app: Application):
+        """Forward a received request towards a next-hop peer, as a relay.
+
+        Implements rfc6733 relay agent behaviour for a request that this node
+        has no local application for. The next hop is selected from the peers
+        configured for the relay application and the request's
+        Destination-Realm, with an explicit Destination-Host pinning the
+        request to a single configured peer. Loop detection is based on the
+        Route-Record AVPs.
+
+        The forwarded request receives a newly allocated hop-by-hop
+        identifier (the original one is remembered for the returning answer),
+        while the end-to-end identifier stays untouched. A Route-Record AVP is
+        appended, with the requesting peer's CER Origin-Host as its value.
+        """
+        realm_name = message.destination_realm.decode()
+        route_records = self._get_route_records(message)
+
+        # rfc6733 6.1.4: a request that has already visited this node loops;
+        # answer with DIAMETER_LOOP_DETECTED and do not forward.
+        if self.origin_host.lower() in route_records:
+            self.logger.warning(
+                f"{conn} request {hex(message.header.hop_by_hop_identifier)} "
+                f"has already visited this node, answering with loop detected")
+            self._send_relay_error_answer(
+                conn, message, message.header.hop_by_hop_identifier,
+                constants.E_RESULT_CODE_DIAMETER_LOOP_DETECTED)
+            return
+
+        configured_peers = self._peer_routes.get(realm_name, {}).get(
+            relay_app, [])
+
+        def peer_identity(peer: Peer) -> str:
+            if peer.connection and peer.connection.host_identity:
+                return peer.connection.host_identity.lower()
+            return peer.node_name.lower()
+
+        # only connected, ready peers are usable; a peer that has already
+        # handled the request further upstream is excluded as a candidate
+        usable_peers = [
+            peer for peer in configured_peers
+            if (peer.connection and
+                    peer.connection.state in PEER_READY_STATES and
+                    peer_identity(peer) not in route_records)]
+
+        destination_host = getattr(message, "destination_host", None)
+        if destination_host:
+            destination_host = destination_host.decode().lower()
+            named_peers = [peer for peer in configured_peers
+                           if peer_identity(peer) == destination_host]
+            if named_peers:
+                # an explicit Destination-Host must be served by that exact
+                # peer; another same-realm peer must not be substituted, if
+                # the requested peer is unavailable or has to be excluded
+                peer = named_peers[0]
+                if peer not in usable_peers:
+                    self.logger.warning(
+                        f"{conn} request {hex(message.header.hop_by_hop_identifier)} "
+                        f"destination host {destination_host} is not available "
+                        f"as a next hop")
+                    self._send_relay_error_answer(
+                        conn, message,
+                        message.header.hop_by_hop_identifier,
+                        constants.E_RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER)
+                    return
+            else:
+                peer = self._select_relay_peer(
+                    relay_app, message, usable_peers, conn, realm_name)
+                if peer is None:
+                    return
+        else:
+            peer = self._select_relay_peer(
+                relay_app, message, usable_peers, conn, realm_name)
+            if peer is None:
+                return
+
+        out_conn = peer.connection
+        new_hop_by_hop = out_conn.hop_by_hop_seq.next_sequence()
+        original_hop_by_hop = message.header.hop_by_hop_identifier
+
+        self._append_route_record(message, conn.host_identity)
+        message.header.hop_by_hop_identifier = new_hop_by_hop
+
+        self._relay_waiting_answer[(
+            out_conn.host_identity, new_hop_by_hop)] = _RelayedRequest(
+            requestor_conn=conn,
+            next_hop_conn=out_conn,
+            original_hop_by_hop=original_hop_by_hop,
+            request=message,
+            sent_at=time.time())
+
+        self.logger.info(
+            f"{conn} relaying request {hex(original_hop_by_hop)} to "
+            f"{out_conn} as {hex(new_hop_by_hop)}")
+        self.send_message(out_conn, message)
+
+    def _select_relay_peer(self, relay_app: Application,
+                           message: _AnyMessageType,
+                           usable_peers: list[Peer],
+                           conn: PeerConnection,
+                           realm_name: str) -> Peer | None:
+        """Pick a next-hop peer from the usable candidates."""
+        if not usable_peers:
+            self.logger.warning(
+                f"{conn} no available next-hop peer in realm {realm_name} "
+                f"for relaying request "
+                f"{hex(message.header.hop_by_hop_identifier)}")
+            self._send_relay_error_answer(
+                conn, message, message.header.hop_by_hop_identifier,
+                constants.E_RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER)
+            return None
+
+        if len(usable_peers) > 1:
+            return self.peer_route_select_func(
+                self, relay_app, message, usable_peers)
+        return usable_peers[0]
+
+    @staticmethod
+    def _get_route_records(message: Message) -> list[str]:
+        """Return all Route-Record identities of a request, lowercased."""
+        records = getattr(message, "route_record", None)
+        if records is None:
+            records = [avp.value for avp in message.find_avps(
+                (constants.AVP_ROUTE_RECORD, 0))]
+        elif not isinstance(records, list):
+            records = [records]
+        return [record.decode().lower() if isinstance(record, bytes)
+                else str(record).lower() for record in records]
+
+    @staticmethod
+    def _append_route_record(message: Message, host_identity: str):
+        """Append a Route-Record AVP value to a request."""
+        records = getattr(message, "route_record", None)
+        if isinstance(records, list):
+            records.append(host_identity.encode())
+        else:
+            message.append_avp(
+                Avp.new(constants.AVP_ROUTE_RECORD,
+                        value=host_identity.encode()))
+
+    def _send_relay_error_answer(self, requestor_conn: PeerConnection,
+                                 request: Message, original_hop_by_hop: int,
+                                 result_code: int):
+        """Send an error answer for a relayed (or to-be-relayed) request."""
+        if requestor_conn.state not in PEER_READY_STATES:
+            self.logger.debug(
+                f"not sending relay error answer {result_code}, the "
+                f"requesting connection is no longer ready")
+            return
+        answer = self._generate_answer(requestor_conn, request)
+        # the request instance may already carry the hop-by-hop ID allocated
+        # for the next hop; restore the one used by the original requester
+        answer.header.hop_by_hop_identifier = original_hop_by_hop
+        answer.result_code = result_code
+        self.send_message(requestor_conn, answer)
+
+    def _return_relayed_answer(self, conn: PeerConnection, message: Message,
+                               pending: _RelayedRequest):
+        """Return an answer received from a next hop to the requester."""
+        message.header.hop_by_hop_identifier = pending.original_hop_by_hop
+
+        if pending.requestor_conn.state not in PEER_READY_STATES:
+            self.logger.warning(
+                f"{conn} got answer {hex(message.header.hop_by_hop_identifier)} "
+                f"for a relayed request, but the requesting peer has gone away")
+            return
+
+        self.logger.debug(
+            f"{conn} returning relayed answer to "
+            f"{pending.requestor_conn} as "
+            f"{hex(message.header.hop_by_hop_identifier)}")
+        self.send_message(pending.requestor_conn, message)
+
+    def _check_relay_answer_timeouts(self):
+        """Fail relayed requests that have waited too long for an answer."""
+        now = time.time()
+        for key, pending in list(self._relay_waiting_answer.items()):
+            if now - pending.sent_at <= self.relay_answer_timeout:
+                continue
+            del self._relay_waiting_answer[key]
+            self.logger.warning(
+                f"next hop {pending.next_hop_host} did not answer relayed "
+                f"request {hex(pending.original_hop_by_hop)} within "
+                f"{self.relay_answer_timeout} seconds")
+            self._send_relay_error_answer(
+                pending.requestor_conn, pending.request,
+                pending.original_hop_by_hop,
+                constants.E_RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER)
+
+    def _fail_relayed_requests_for_conn(self, conn: PeerConnection):
+        """Drop/error pending relay states related to a closed connection.
+
+        Requests forwarded over the closed connection fail with
+        DIAMETER_UNABLE_TO_DELIVER towards their requesters, with no failover
+        to other next hops. Requests that arrived over it are simply dropped.
+        """
+        for key, pending in list(self._relay_waiting_answer.items()):
+            if pending.next_hop_conn is conn:
+                del self._relay_waiting_answer[key]
+                self.logger.warning(
+                    f"next-hop connection {conn} was lost while a relayed "
+                    f"request was pending, answering "
+                    f"{hex(pending.original_hop_by_hop)} with unable to deliver")
+                self._send_relay_error_answer(
+                    pending.requestor_conn, pending.request,
+                    pending.original_hop_by_hop,
+                    constants.E_RESULT_CODE_DIAMETER_UNABLE_TO_DELIVER)
+            elif pending.requestor_conn is conn:
+                del self._relay_waiting_answer[key]
 
     def _receive_app_answer(self, conn: PeerConnection, message: Message):
         """Forward a received answer message to an application.
@@ -974,6 +1243,20 @@ class Node:
         app_id = message.header.application_id
         message_id = (f"{message.header.hop_by_hop_identifier}:"
                       f"{message.header.end_to_end_identifier}")
+
+        # answers to requests this node has relayed are returned to the
+        # original requesters, restoring the original hop-by-hop identifier.
+        # An answer that arrives after the request has already failed
+        # (timeout or next-hop disconnect) is no longer tracked and is
+        # ignored like any unknown answer.
+        relay_pending = self._relay_waiting_answer.pop(
+            (conn.host_identity, message.header.hop_by_hop_identifier), None)
+        if relay_pending is not None:
+            # the next hop's answer created a bookkeeping entry on arrival;
+            # it is never answered back towards the next hop
+            self._origin_waiting_answer.pop(message_id, None)
+            self._return_relayed_answer(conn, message, relay_pending)
+            return
 
         # rfc6733, 6.2.1: we are expected to just ignore unkown hop-by-hop
         # identifiers. Not 100% spec compliant, we only track app-routed
@@ -1244,9 +1527,14 @@ class Node:
             # rfc6733 states TCP sockets must be closed with a RESET call,
             # while sctp sockets must be aborted
             if conn.socket_proto == PEER_TRANSPORT_TCP:
-                peer_socket.setsockopt(
-                    socket.SOL_SOCKET, socket.SO_LINGER,
-                    struct.pack("ii", 1, 0))
+                try:
+                    peer_socket.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER,
+                        struct.pack("ii", 1, 0))
+                except OSError:
+                    # some platforms reject SO_LINGER on a socket that has
+                    # already been reset or closed; it is closing anyway
+                    pass
             peer_socket.close()
             conn.close(False)
 
@@ -1346,15 +1634,26 @@ class Node:
         supported_auth_apps = list(self.auth_application_ids & cer_auth_apps)
         supported_acct_apps = list(self.acct_application_ids & cer_acct_apps)
 
-        if not supported_auth_apps and not supported_acct_apps and not is_relay:
+        no_common_apps = not supported_auth_apps and not supported_acct_apps
+        # rfc6733: a relay agent relays every application, so a connection is
+        # accepted either when the remote peer is a relay, or when this node
+        # itself acts as a relay, even if the peers have no application IDs in
+        # common.
+        if no_common_apps and not is_relay and self.relay_app is None:
             self.logger.warning(f"{conn} no supported application IDs")
             answer.result_code = constants.E_RESULT_CODE_DIAMETER_NO_COMMON_APPLICATION
             self.send_message(conn, answer)
             return
 
-        elif not supported_auth_apps and not supported_acct_apps and is_relay:
-            self.logger.info(
-                f"{conn} peer is a relay agent with no supported applications")
+        elif no_common_apps:
+            if is_relay and self.relay_app is not None:
+                relay_note = "both peers are relay agents"
+            elif is_relay:
+                relay_note = "peer is a relay agent with no supported applications"
+            else:
+                relay_note = ("this node is a relay agent and accepts the "
+                              "peer's applications")
+            self.logger.info(f"{conn} {relay_note}")
 
         conn.auth_application_ids = supported_auth_apps
         conn.acct_application_ids = supported_acct_apps
@@ -1441,6 +1740,12 @@ class Node:
         # persist its hop-by-hop IDs over reconnect.
         if conn.host_identity in self._peer_waiting_answer:
             del self._peer_waiting_answer[conn.host_identity]
+
+        # Relay bookkeeping: if the lost connection carried requests forwarded
+        # to a next hop, fail them with unable-to-deliver without trying
+        # another next hop. If it carried the original requests, just drop
+        # the pending state.
+        self._fail_relayed_requests_for_conn(conn)
 
         # Check if this was the last available peer for an app and clear app
         # ready flag if so, resulting in `wait_for_ready` to block again.
