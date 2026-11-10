@@ -8,6 +8,7 @@ import math
 import os
 import select
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -160,16 +161,18 @@ class Node:
     initiated and managed by the client. When acting as a server, connections
     can be established by any party.
 
-    The node supports both TCP and SCTP transport modes. When acting as a
-    server, it can always listen on multiple addresses, however this is only
-    useful when utilising SCTP, as other peers will only connect to a single
-    TCP address at a time.
+    The node supports TCP, SCTP and TLS over TCP transport modes. When acting
+    as a server, it can always listen on multiple addresses, however this is
+    only useful when utilising SCTP, as other peers will only connect to a
+    single TCP address at a time.
 
     The node can connect to multiple peers simultaneously; peers can be added
-    using [`Node.add_peer`][diameter.node.Node.add_peer]. Both TCP and SCTP
-    transport modes are accepted and can be mixed at will. Peers can be flagged
-    as persistent, in which case the Node will periodically attempt to
-    reconnect, if a connection is lost.
+    using [`Node.add_peer`][diameter.node.Node.add_peer]. TCP, SCTP and TLS
+    over TCP transport modes are accepted and can be mixed at will. Peers
+    added with an aaas:// URI always use TLS over TCP, regardless of any
+    transport parameter in the URI. Peers can be flagged as persistent, in
+    which case the Node will periodically attempt to reconnect, if a
+    connection is lost.
 
         >>> node = Node()
         >>> node.add_peer("aaa://dra1.gy:3868;transport=tcp", "realm.net", ["10.16.17.5"])
@@ -196,7 +199,10 @@ class Node:
     def __init__(self, origin_host: str, realm_name: str,
                  ip_addresses: list[str] = None,
                  tcp_port: int = None, sctp_port: int = None,
-                 vendor_ids: list[int] = None):
+                 vendor_ids: list[int] = None,
+                 tls_port: int = None,
+                 tls_server_context: ssl.SSLContext = None,
+                 tls_client_context: ssl.SSLContext = None):
         """Create a new diameter node.
 
         Args:
@@ -213,6 +219,30 @@ class Node:
             vendor_ids: List of supported vendor IDs. If not set, will default
                 to all known vendor IDs. The list of vendor IDs is only used
                 in advertising the node's capabilities in  CER/CEA
+            tls_port: An optional TLS/TCP listen port. A TLS listener is only
+                created when both this and `tls_server_context` are set; no
+                TLS port is selected automatically when this is not given.
+                The default port for aaas:// peers is 5868 (rfc6733 11.4,
+                errata 3997)
+            tls_server_context: A caller-built `ssl.SSLContext` used for
+                accepting TLS connections. The context must contain the trust
+                roots against which peer client certificates are validated.
+                The node forces certificate-based peer authentication: any
+                `verify_mode` configured by the caller is overridden to
+                `ssl.CERT_REQUIRED`, so connections without a client
+                certificate or with a certificate that fails validation
+                against the loaded trust roots are rejected during the TLS
+                handshake and never reach a ready state
+            tls_client_context: A caller-built `ssl.SSLContext` used for
+                outgoing TLS connections to aaas:// peers. The context must
+                contain the trust roots against which server certificates are
+                validated. The node forces full validation regardless of the
+                caller's own settings: `verify_mode` is set to
+                `ssl.CERT_REQUIRED` and `check_hostname` to `True`, with the
+                FQDN from the peer URI used as the expected certificate name
+                (the connected IP address is never used as the name). When
+                this is not given, aaas:// peers do not initiate any TCP
+                connection
 
         """
         self._busy_lock = threading.Lock()
@@ -250,6 +280,25 @@ class Node:
         self.ip_addresses: list[str] = ip_addresses or []
         self.tcp_port: int | None = tcp_port
         self.sctp_port: int | None = sctp_port
+        self.tls_port: int | None = tls_port
+        """TLS/TCP listen port. A TLS listener is created only when both this
+        and `tls_server_context` are set."""
+        # rfc6733 11.4: TLS connections must always authenticate the peer with
+        # a certificate. The contexts are caller-built and already carry the
+        # required certificates and trust roots, but the verification settings
+        # are enforced here so that a misconfigured context cannot silently
+        # downgrade the connection to an unauthenticated one.
+        if tls_server_context is not None:
+            tls_server_context.verify_mode = ssl.CERT_REQUIRED
+        self.tls_server_context: ssl.SSLContext | None = tls_server_context
+        """SSL context used for accepting incoming TLS connections."""
+        if tls_client_context is not None:
+            tls_client_context.verify_mode = ssl.CERT_REQUIRED
+            # check_hostname may only be enabled while a certificate is
+            # required, which has just been forced above
+            tls_client_context.check_hostname = True
+        self.tls_client_context: ssl.SSLContext | None = tls_client_context
+        """SSL context used for outgoing TLS connections to aaas:// peers."""
         self.realm_name: str = realm_name
         self.state_id: int = int(time.time())
 
@@ -351,6 +400,9 @@ class Node:
 
         self.tcp_sockets: list[socket.socket] = []
         self.sctp_sockets: list[sctp.sctpsocket] = []
+        self.tls_sockets: list[socket.socket] = []
+        """Plain TCP listening sockets that upgrade each accepted connection
+        to TLS using `tls_server_context`."""
         self._connection_thread: StoppableThread = StoppableThread(
             target=self._handle_connections)
         self._stat_collect_thread: StoppableThread = StoppableThread(
@@ -471,6 +523,24 @@ class Node:
             cea_timeout = peer.cea_timeout or cea_timeout
             cer_timeout = peer.cer_timeout or cer_timeout
 
+        if conn.use_tls and not conn.tls_handshake_done:
+            # A stalled TLS handshake (e.g. a peer that opened the TCP
+            # connection but never starts or completes the handshake) must be
+            # cleaned up, but it must never block other peers from connecting
+            # or exchanging messages. The deadline is measured from the
+            # connection creation time rather than the last socket event, so a
+            # peer that keeps producing half-open events cannot postpone it.
+            # The handshake is part of connection establishment, so the CE
+            # timeouts are reused here.
+            handshake_timeout = cea_timeout if conn.is_sender else cer_timeout
+            if time.time() - conn.tls_handshake_started > handshake_timeout:
+                self.logger.warning(
+                    f"{conn} exceeded TLS handshake timeout, closing "
+                    f"connection")
+                self.close_connection_socket(
+                    conn, DISCONNECT_REASON_FAILED_CONNECT_CE)
+            return
+
         if conn.state == PEER_CONNECTED:
             if conn.is_sender and conn.last_read_since > cea_timeout:
                 self.logger.warning(
@@ -523,7 +593,47 @@ class Node:
                 f"{peer.node_name} has no socket configuration present")
             return
 
-        if peer.transport == PEER_TRANSPORT_TCP:
+        if peer.transport == PEER_TRANSPORT_TLS:
+            if self.tls_client_context is None:
+                # The caller has not provided a client context: aaas:// peers
+                # must not fall back to plaintext, so no connection is made at
+                # all. This is not an error for add_peer or start.
+                self.logger.debug(
+                    f"{peer.node_name} is configured for TLS but the node has "
+                    f"no tls_client_context, not initiating a connection")
+                return
+
+            # Start from a plain non-blocking TCP socket. The TLS wrapper is
+            # added only after the TCP connection attempt has completed, since
+            # the standard library drops the internal SSL object of a
+            # non-blocking socket whose connect() returns EINPROGRESS.
+            peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            peer_socket.setblocking(False)
+
+            conn = PeerConnection(peer.ip_addresses, peer.port,
+                                  PEER_SEND, self.interrupt_write)
+            conn.state = PEER_CONNECTING
+            conn.node_name = peer.node_name
+            conn.origin_host = self.origin_host
+            conn.use_tls = True
+            # the first step is establishing the TCP connection, which needs
+            # writability
+            conn.tls_wait_write = True
+            self._add_peer_connection(conn, peer_socket, PEER_TRANSPORT_TLS)
+
+            try:
+                peer_socket.connect((peer.ip_addresses[0],
+                                     peer.port))
+            except socket.error as e:
+                if e.args[0] != errno.EINPROGRESS:
+                    self.remove_peer_connection(
+                        conn, DISCONNECT_REASON_SOCKET_FAIL)
+                    return
+                self.logger.warning(f"{conn} socket not yet ready, waiting")
+
+            conn.host_ip_address = [peer_socket.getsockname()[0]]
+
+        elif peer.transport == PEER_TRANSPORT_TCP:
             peer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             peer_socket.setblocking(False)
 
@@ -598,6 +708,255 @@ class Node:
         self.connection_logger.info(
             f"{conn} is now connected, waiting CER/CEA to complete")
 
+    def _init_tls_server(self, conn: PeerConnection):
+        """Create the server-side SSL object and memory BIOs for a freshly
+        accepted raw TCP connection. No I/O is performed here, the handshake
+        is driven by the main connection loop."""
+        in_bio = ssl.MemoryBIO()
+        out_bio = ssl.MemoryBIO()
+        conn.tls_in_bio = in_bio
+        conn.tls_out_bio = out_bio
+        conn.tls_object = self.tls_server_context.wrap_bio(
+            in_bio, out_bio, server_side=True)
+
+    def _init_tls_client(self, conn: PeerConnection):
+        """Create the client-side SSL object and memory BIOs for an outgoing
+        connection whose raw TCP connect has just completed.
+
+        The FQDN from the peer URI is the name the server certificate is
+        validated against; the TCP connection itself uses the separately
+        configured peer IP address, which is never used as a certificate
+        name.
+        """
+        in_bio = ssl.MemoryBIO()
+        out_bio = ssl.MemoryBIO()
+        conn.tls_in_bio = in_bio
+        conn.tls_out_bio = out_bio
+        conn.tls_object = self.tls_client_context.wrap_bio(
+            in_bio, out_bio, server_side=False,
+            server_hostname=conn.node_name)
+
+    def _tls_drain(self, conn: PeerConnection,
+                   peer_socket: socket.socket):
+        """Write all encrypted bytes produced by the SSL object to the raw
+        TCP socket.
+
+        Bytes that the non-blocking socket cannot accept are retained in
+        `conn.tls_out_pending` and retried on the next writable event. Using
+        the memory BIO machinery means every encrypted byte is tracked
+        explicitly here; unlike with `ssl.SSLSocket`, nothing can remain
+        stuck in a hidden SSL-internal send buffer.
+        """
+        if conn.tls_out_pending:
+            try:
+                sent = peer_socket.send(conn.tls_out_pending)
+            except socket.error as e:
+                if e.args[0] in SOFT_SOCKET_FAILURES:
+                    return
+                raise
+            conn.tls_out_pending = conn.tls_out_pending[sent:]
+            if conn.tls_out_pending:
+                # kernel send buffer is full, the rest has to wait
+                return
+
+        if conn.tls_out_bio.pending:
+            data = conn.tls_out_bio.read()
+            try:
+                sent = peer_socket.send(data)
+            except socket.error as e:
+                if e.args[0] in SOFT_SOCKET_FAILURES:
+                    conn.tls_out_pending = data
+                    return
+                raise
+            if sent < len(data):
+                conn.tls_out_pending = data[sent:]
+
+    def _tls_do_handshake(self, conn: PeerConnection,
+                          peer_socket: socket.socket) -> bool:
+        """Drive a non-blocking TLS handshake for a single connection.
+
+        No diameter messages are sent or processed before the handshake has
+        completed, and a failed handshake (e.g. a missing or untrusted peer
+        certificate, a hostname mismatch, or plaintext bytes sent to the TLS
+        listener) closes the connection without it ever reaching a ready
+        state.
+
+        Returns:
+            True when the handshake has completed, False otherwise.
+
+        """
+        try:
+            conn.tls_object.do_handshake()
+        except ssl.SSLWantReadError:
+            # waiting for more encrypted bytes from the peer
+            conn.tls_wait_read = True
+            conn.tls_wait_write = False
+            self._tls_drain(conn, peer_socket)
+            return False
+        except ssl.SSLWantWriteError:
+            # handshake has produced bytes that must be sent to the peer
+            conn.tls_wait_read = False
+            conn.tls_wait_write = True
+            self._tls_drain(conn, peer_socket)
+            return False
+        except ssl.SSLError as e:
+            self.connection_logger.warning(
+                f"{conn} TLS handshake failed: {e}, closing connection")
+            self.close_connection_socket(
+                conn, DISCONNECT_REASON_SOCKET_FAIL)
+            return False
+
+        conn.tls_handshake_done = True
+        conn.tls_wait_read = False
+        conn.tls_wait_write = False
+        conn.reset_last_read()
+        self._tls_drain(conn, peer_socket)
+        self.connection_logger.info(
+            f"{conn} TLS handshake completed, cipher: "
+            f"{conn.tls_object.cipher()[0]}")
+        self._flag_peer_as_connected(conn)
+        if conn.is_sender:
+            # only now, after the encrypted channel is established, the
+            # capabilities exchange may start
+            self.send_cer(conn)
+        return True
+
+    def _handle_tls_readable(self, conn: PeerConnection,
+                             peer_socket: socket.socket):
+        """Handle readability of a TLS connection's raw TCP socket."""
+        if conn.tls_object is None:
+            # outgoing connection whose TCP connect has not been processed
+            # yet; let the writable handler advance it
+            return
+
+        try:
+            data = peer_socket.recv(2048)
+        except socket.error as e:
+            if e.args[0] in SOFT_SOCKET_FAILURES:
+                self.connection_logger.debug(
+                    f"{conn} socket read soft fail: {e.args[1]}, "
+                    f"errno {e.args[0]}, trying again")
+                return
+            self.connection_logger.warning(
+                f"{conn} socket read fail: {e.args[1]}, errno {e.args[0]}, "
+                f"disconnecting peer")
+            self.close_connection_socket(
+                conn, DISCONNECT_REASON_SOCKET_FAIL)
+            conn.close(signal_node=False)
+            return
+
+        if len(data) == 0:
+            self.connection_logger.warning(
+                f"{conn} has gone away (read zero bytes), closing socket "
+                f"and removing peer")
+            self.close_connection_socket(
+                conn, DISCONNECT_REASON_GONE_AWAY)
+            conn.close(signal_node=False)
+            return
+
+        conn.tls_in_bio.write(data)
+
+        if not conn.tls_handshake_done:
+            if not self._tls_do_handshake(conn, peer_socket):
+                return
+            # the handshake may have completed using bytes that arrived in the
+            # same read, and post-handshake application data can already be
+            # sitting in the input BIO; fall through to decrypt it now since
+            # no further socket event may be delivered for it
+
+        conn.reset_last_read()
+        while True:
+            try:
+                plain = conn.tls_object.read(2048)
+            except ssl.SSLWantReadError:
+                # everything currently available has been decrypted
+                break
+            except ssl.SSLWantWriteError:
+                # a renegotiation needs encrypted bytes out first
+                self._tls_drain(conn, peer_socket)
+                break
+            except ssl.SSLError as e:
+                self.connection_logger.warning(
+                    f"{conn} TLS read failed: {e}, disconnecting peer")
+                self.close_connection_socket(
+                    conn, DISCONNECT_REASON_SOCKET_FAIL)
+                conn.close(signal_node=False)
+                return
+            if not plain:
+                # SSLObject.read returns an empty bytes object once the peer
+                # has signalled a TLS shutdown (close_notify)
+                self.connection_logger.warning(
+                    f"{conn} TLS session shut down by peer, closing socket "
+                    f"and removing peer")
+                self.close_connection_socket(
+                    conn, DISCONNECT_REASON_GONE_AWAY)
+                conn.close(signal_node=False)
+                return
+            conn.add_in_bytes(plain)
+
+    def _handle_tls_writable(self, conn: PeerConnection,
+                             peer_socket: socket.socket):
+        """Handle writability of a TLS connection's raw TCP socket."""
+        if conn.tls_object is None:
+            # the raw TCP connect of an outgoing TLS connection has completed
+            socket_error = peer_socket.getsockopt(
+                socket.SOL_SOCKET, socket.SO_ERROR)
+            if socket_error != 0:
+                self.connection_logger.warning(
+                    f"{conn} connection socket has permanently failed with "
+                    f"error {socket_error}, removing connection")
+                self.close_connection_socket(
+                    conn, DISCONNECT_REASON_FAILED_CONNECT)
+                conn.close(signal_node=False)
+                return
+            try:
+                self._init_tls_client(conn)
+            except ssl.SSLError as e:
+                self.connection_logger.warning(
+                    f"{conn} failed to create a TLS context: {e}")
+                self.close_connection_socket(
+                    conn, DISCONNECT_REASON_SOCKET_FAIL)
+                return
+
+        if not conn.tls_handshake_done:
+            self._tls_do_handshake(conn, peer_socket)
+            return
+
+        try:
+            self._tls_drain(conn, peer_socket)
+
+            if len(conn.write_buffer) > 0:
+                try:
+                    consumed = conn.tls_object.write(conn.write_buffer)
+                except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                    # the TLS layer cannot accept more plaintext right now;
+                    # any encrypted output is drained above and retried later
+                    self._tls_drain(conn, peer_socket)
+                    return
+                if consumed:
+                    conn.remove_out_bytes(consumed)
+                self._tls_drain(conn, peer_socket)
+
+            if len(conn.write_buffer) == 0 and conn.state == PEER_CLOSING:
+                self.connection_logger.debug(
+                    f"{conn} in CLOSING state nothing to write, closing socket")
+                self.close_connection_socket(
+                    conn, DISCONNECT_REASON_CLEAN_DISCONNECT)
+        except ssl.SSLError as e:
+            self.connection_logger.warning(
+                f"{conn} TLS write failed: {e}, disconnecting peer")
+            conn.close()
+        except socket.error as e:
+            if e.args[0] in SOFT_SOCKET_FAILURES:
+                self.connection_logger.debug(
+                    f"{conn} socket write soft fail: {e.args[1]}, "
+                    f"errno {e.args[0]}, trying again")
+            else:
+                self.connection_logger.warning(
+                    f"{conn} socket write fail: {e.args[1]}, errno "
+                    f"{e.args[0]}, disconnecting peer")
+                conn.close()
+
     def _flag_connection_as_ready(self, conn: PeerConnection):
         conn.state = PEER_READY
         for app_peers in self._peer_routes.values():
@@ -648,26 +1007,78 @@ class Node:
                     conn.close(signal_node=False)
                 return
 
-            r_list = [self.interrupt_read]
-            w_list = []
-            if self.tcp_sockets:
-                r_list += self.tcp_sockets
-            if self.sctp_sockets:
-                r_list += self.sctp_sockets
-            for conn_id, conn_socket in self.peer_sockets.items():
-                conn = self.connections.get(conn_id)
-                if not conn:
+            # Peer connection worker threads (e.g. work_read_queue handling a
+            # CER/CEA rejection) can close a peer socket and update the peer
+            # maps concurrently with this loop. Rebuild the watch sets and
+            # retry instead of letting the whole connection thread terminate
+            # on a file descriptor that went stale between the two.
+            for select_attempt in range(4):
+                r_list = [self.interrupt_read]
+                w_list = []
+                if self.tcp_sockets:
+                    r_list += self.tcp_sockets
+                if self.sctp_sockets:
+                    r_list += self.sctp_sockets
+                if self.tls_sockets:
+                    r_list += self.tls_sockets
+                try:
+                    peer_socket_items = list(self.peer_sockets.items())
+                except RuntimeError:
+                    # the peer map was modified by a worker thread, rebuild
                     continue
-                if conn.state != PEER_CLOSED:
-                    r_list.append(conn_socket)
-                # peer is either waiting for the initial socket to become ready,
-                # or wants to send something
-                if (conn.state == PEER_CONNECTING or
-                        (conn.state != PEER_CLOSED and len(conn.write_buffer) > 0)):
-                    w_list.append(conn_socket)
+                for conn_id, conn_socket in peer_socket_items:
+                    conn = self.connections.get(conn_id)
+                    if not conn:
+                        continue
+                    tls_handshaking = conn.use_tls and not conn.tls_handshake_done
+                    if conn.state != PEER_CLOSED:
+                        # while a TLS handshake is in progress only watch the
+                        # direction the TLS layer is currently blocked on,
+                        # otherwise an always-writable socket would turn the
+                        # select loop into a busy loop
+                        if not tls_handshaking or conn.tls_wait_read:
+                            r_list.append(conn_socket)
+                    # peer is either waiting for the initial socket to become
+                    # ready, or wants to send something
+                    wants_write = (
+                        conn.state == PEER_CONNECTING or
+                        (conn.state != PEER_CLOSED
+                         and len(conn.write_buffer) > 0))
+                    if conn.use_tls and not tls_handshaking:
+                        # encrypted bytes already produced by the TLS machinery
+                        # must also keep the socket selected for writing, even
+                        # though the plaintext write buffer may be empty
+                        wants_write = (
+                            wants_write or bool(conn.tls_out_pending) or
+                            (conn.tls_out_bio is not None
+                             and conn.tls_out_bio.pending > 0))
+                    if wants_write:
+                        if not tls_handshaking or conn.tls_wait_write:
+                            w_list.append(conn_socket)
 
-            ready_r, ready_w, _ = select.select(
-                r_list, w_list, [], self.wakeup_interval)
+                try:
+                    ready_r, ready_w, _ = select.select(
+                        r_list, w_list, [], self.wakeup_interval)
+                    break
+                except ValueError as e:
+                    # a closed socket reports fileno() == -1 to select
+                    self.connection_logger.warning(
+                        f"select saw a socket closed concurrently by a worker "
+                        f"thread ({e}), rebuilding watch sets")
+                    continue
+                except OSError as e:
+                    if e.errno != errno.EBADF:
+                        raise
+                    # one of the watched descriptors was closed by a worker
+                    # thread after the watch sets were built
+                    self.connection_logger.warning(
+                        f"select saw a stale file descriptor closed by a "
+                        f"worker thread ({e}), rebuilding watch sets")
+                    continue
+            else:
+                # the maps kept changing for every attempt, try again from
+                # the top of the connection loop
+                continue
 
             for rsock in ready_r:
                 if rsock == self.interrupt_read:
@@ -720,11 +1131,50 @@ class Node:
                                               PEER_TRANSPORT_SCTP)
                     continue
 
+                if rsock in self.tls_sockets:
+                    self.connection_logger.debug(
+                        "received a TLS/TCP connection attempt")
+                    clientsocket, (ip, port) = rsock.accept()
+                    clientsocket.setblocking(False)
+                    self.connection_logger.debug(
+                        f"new client TLS connection from {ip}:{port}")
+
+                    conn = PeerConnection(ip, port, PEER_RECV,
+                                          interrupt_fileno=self.interrupt_write)
+                    # stay in CONNECTING until the TLS handshake completes;
+                    # no diameter message may be exchanged before that
+                    conn.state = PEER_CONNECTING
+                    conn.use_tls = True
+                    # the server side first waits for the client ClientHello
+                    conn.tls_wait_read = True
+                    self._add_peer_connection(conn, clientsocket,
+                                              PEER_TRANSPORT_TLS)
+                    try:
+                        # memory BIOs, the handshake itself is driven by the
+                        # connection loop instead of happening inside recv()
+                        self._init_tls_server(conn)
+                    except ssl.SSLError as e:
+                        self.connection_logger.warning(
+                            f"failed to initialize TLS for connection from "
+                            f"{ip}:{port}: {e}")
+                        self.close_connection_socket(
+                            conn, DISCONNECT_REASON_SOCKET_FAIL)
+                        continue
+                    conn.demand_attention()
+                    continue
+
                 conn = self.socket_peers.get(rsock.fileno())
                 if not conn:
                     self.connection_logger.warning(
                         f"socket {rsock.fileno()} ready for reading but no "
                         f"peer connected, ignoring")
+                    continue
+
+                if conn.use_tls:
+                    # feeds encrypted bytes into the TLS input BIO, drives the
+                    # handshake while it is pending, and only then hands
+                    # decrypted diameter bytes to the peer connection
+                    self._handle_tls_readable(conn, rsock)
                     continue
 
                 self.connection_logger.debug(f"{conn} ready to receive")
@@ -764,6 +1214,14 @@ class Node:
                         f"socket {wsock.fileno()} ready for writing but the "
                         f"peer has gone, ignoring")
                     continue
+
+                if conn.use_tls:
+                    # checks the TCP connect result, initializes the memory
+                    # BIO TLS machinery, drives the handshake and then pushes
+                    # encrypted diameter bytes onto the raw TCP socket
+                    self._handle_tls_writable(conn, wsock)
+                    continue
+
                 if conn.state == PEER_CONNECTING:
                     socket_error = wsock.getsockopt(
                         socket.SOL_SOCKET, socket.SO_ERROR)
@@ -789,13 +1247,13 @@ class Node:
                     continue
 
                 try:
-                    if conn.socket_proto == PEER_TRANSPORT_TCP:
-                        sent_bytes = wsock.send(conn.write_buffer)
-                    else:
+                    if conn.socket_proto == PEER_TRANSPORT_SCTP:
                         # rfc6733, 2.1.1: to avoid head-of-the-line blocking,
                         # the recommended way is to set the unordered flag
                         sent_bytes = wsock.sctp_send(
                             conn.write_buffer, flags=sctp.MSG_UNORDERED)
+                    else:
+                        sent_bytes = wsock.send(conn.write_buffer)
                 except socket.error as e:
                     if e.args[0] in SOFT_SOCKET_FAILURES:
                         self.connection_logger.debug(
@@ -1172,10 +1630,13 @@ class Node:
 
         Args:
             peer_uri: A diameter node's DiameterIdentity as a DiameterURI
-                string, i.e. "aaa://<fqdn>:<port>;transport=<transport>".
-                The URI must contain at least the scheme and FQDN;
-                the port and transport will default to 3868 and "TCP" if not
-                included
+                string, i.e. "aaa://<fqdn>:<port>;transport=<transport>" or
+                "aaas://<fqdn>:<port>;transport=<transport>" for a TLS/TCP
+                peer. The URI must contain at least the scheme and FQDN;
+                the port and transport will default to 3868 and "TCP" for
+                aaa:// URIs, and to 5868 and TLS/TCP for aaas:// URIs if not
+                included. An aaas:// peer always uses TLS/TCP regardless of
+                any transport parameter
             realm_name: Peer realm name. If not given, will be set to the
                 same realm as the node has been configured with
             ip_addresses: A list of IP addresses for the peer. If not given,
@@ -1201,12 +1662,19 @@ class Node:
         if uri.fqdn in self.peers:
             return self.peers[uri.fqdn]
 
-        transport = uri.params.get("transport", "tcp").lower()
-        transport = PEER_TRANSPORT_SCTP if transport == "sctp" else PEER_TRANSPORT_TCP
+        if uri.is_secure:
+            # rfc6733: an aaas:// URI always means TLS over TCP. The optional
+            # transport parameter (even transport=sctp) is ignored, there is
+            # no DTLS support and the connection never falls back to
+            # plaintext.
+            transport = PEER_TRANSPORT_TLS
+        else:
+            transport = uri.params.get("transport", "tcp").lower()
+            transport = PEER_TRANSPORT_SCTP if transport == "sctp" else PEER_TRANSPORT_TCP
 
-        if transport == PEER_TRANSPORT_SCTP and sctp is None:
-            raise RuntimeError("Peer is set to use SCTP, but pysctp is "
-                               "not installed")
+            if transport == PEER_TRANSPORT_SCTP and sctp is None:
+                raise RuntimeError("Peer is set to use SCTP, but pysctp is "
+                                   "not installed")
         peer = Peer(
             node_name=uri.fqdn,
             realm_name=realm_name or self.realm_name,
@@ -1242,11 +1710,18 @@ class Node:
         if peer_socket:
             self.connection_logger.info(f"{conn} shutting down socket")
             # rfc6733 states TCP sockets must be closed with a RESET call,
-            # while sctp sockets must be aborted
-            if conn.socket_proto == PEER_TRANSPORT_TCP:
-                peer_socket.setsockopt(
-                    socket.SOL_SOCKET, socket.SO_LINGER,
-                    struct.pack("ii", 1, 0))
+            # while sctp sockets must be aborted. TLS runs on top of TCP and
+            # uses the same reset behaviour. Some platforms reject the option
+            # with EINVAL on a socket whose connect attempt already failed, in
+            # which case closing the socket is sufficient.
+            if conn.socket_proto != PEER_TRANSPORT_SCTP:
+                try:
+                    peer_socket.setsockopt(
+                        socket.SOL_SOCKET, socket.SO_LINGER,
+                        struct.pack("ii", 1, 0))
+                except OSError as e:
+                    self.connection_logger.debug(
+                        f"{conn} could not set SO_LINGER before close: {e}")
             peer_socket.close()
             conn.close(False)
 
@@ -1694,6 +2169,19 @@ class Node:
             sctp_socket.setblocking(False)
             self.sctp_sockets.append(sctp_socket)
 
+        if self.ip_addresses and self.tls_port and self.tls_server_context:
+            # the TLS listener is only created when both a port and a server
+            # context are configured; no TLS port is picked automatically
+            for ip_addr in self.ip_addresses:
+                tls_socket = socket.socket(
+                    socket.AF_INET, socket.SOCK_STREAM)
+                tls_socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                tls_socket.bind((ip_addr, self.tls_port))
+                tls_socket.listen(128)
+                tls_socket.setblocking(False)
+                self.tls_sockets.append(tls_socket)
+
         self._stat_collect_thread.start()
         self._connection_thread.start()
 
@@ -1762,6 +2250,11 @@ class Node:
                 socket.SOL_SOCKET, socket.SO_LINGER,
                 struct.pack("ii", 1, 0))
             tcp_socket.close()
+        for tls_socket in self.tls_sockets:
+            tls_socket.setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER,
+                struct.pack("ii", 1, 0))
+            tls_socket.close()
         for sctp_socket in self.sctp_sockets:
             # rfc6733 wants an SCTP ABORT here, but pysctp has no easy way of
             # doing so, so just being unpolite and sending a shutdown

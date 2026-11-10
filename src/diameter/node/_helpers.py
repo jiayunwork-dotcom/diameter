@@ -20,7 +20,8 @@ class DiameterUri(NamedTuple):
     """The fully qualified domain name or IP address portion of the URI."""
     port: int
     """Port portion of the URI. If the URI does not contain an explicit port,
-    this will default to 3868, or to 5686 for secure transports."""
+    this will default to 3868 for aaa:// URIs, or to 5868 for secure aaas://
+    transports, as specified in rfc6733 section 11.4 (and errata 3997)."""
     params: dict
     """A dictionary of key-value string pairs; the additional parameters 
     within the URI."""
@@ -61,7 +62,9 @@ def parse_diameter_uri(uri: str) -> DiameterUri:
         port = int(port)
     else:
         fqdn = fqdn_port
-        port = 5658 if scheme == "aaas" else 3868
+        # rfc6733 11.4, with errata 3997: the default Diameter/TLS/TCP port is
+        # 5868, not the originally published 5658
+        port = 5868 if scheme == "aaas" else 3868
 
     params = dict(p.split("=") for p in param_str.split(";")
                   if p and "=" in p)

@@ -17,7 +17,8 @@ from ._helpers import SecondSlotCounter, SequenceGenerator, StoppableThread
 
 
 __all__ = ["PEER_RECV", "PEER_SEND", "PEER_TRANSPORT_TCP",
-           "PEER_TRANSPORT_SCTP", "PEER_CONNECTING", "PEER_CONNECTED",
+           "PEER_TRANSPORT_SCTP", "PEER_TRANSPORT_TLS", "PEER_CONNECTING",
+           "PEER_CONNECTED",
            "PEER_READY", "PEER_READY_WAITING_DWA", "PEER_DISCONNECTING",
            "PEER_CLOSING", "PEER_CLOSED", "PEER_READY_STATES",
            "DISCONNECT_REASON_DPR", "DISCONNECT_REASON_NODE_SHUTDOWN",
@@ -36,6 +37,10 @@ PEER_TRANSPORT_TCP = 0x0a
 """Peer connection is via TCP."""
 PEER_TRANSPORT_SCTP = 0x0b
 """Peer connection is via SCTP."""
+PEER_TRANSPORT_TLS = 0x0c
+"""Peer connection is via TLS over TCP, as described in rfc6733 section 11.4.
+TLS is always negotiated at connection establishment, no in-band security
+negotiation is performed."""
 PEER_CONNECTING = 0x10
 """Peer is in a state waiting for socket to become active."""
 PEER_CONNECTED = 0x11
@@ -231,11 +236,12 @@ class Peer:
     realm_name: str
     """Configured realm name."""
     transport: int
-    """Transport method, either `PEER_TRANSPORT_TCP` or 
-    `PEER_TRANSPORT_SCTP`."""
+    """Transport method, either `PEER_TRANSPORT_TCP`,
+    `PEER_TRANSPORT_SCTP` or `PEER_TRANSPORT_TLS`."""
     port: int
     """Port number is always set, even if the peer has not been configured 
-    for outgoing connections. It defaults to 3868."""
+    for outgoing connections. It defaults to 3868 for aaa:// peers and to
+    5868 for aaas:// peers."""
     ip_addresses: list[str] = dataclasses.field(default_factory=list)
     """A list of IP addresses configured for the peer."""
     persistent: bool = False
@@ -380,8 +386,41 @@ class PeerConnection:
         """The ID of the underlying socket. The peer does not hold the socket 
         itself, only the ID. The sockets are tracked by the parent node."""
         self.socket_proto: int = 0
-        """Connected socket protocol, either PEER_TRANSPORT_TCP or 
-        PEER_TRANSPORT_SCTP."""
+        """Connected socket protocol, either PEER_TRANSPORT_TCP,
+        PEER_TRANSPORT_SCTP or PEER_TRANSPORT_TLS."""
+        self.use_tls: bool = False
+        """Indicates that the connection uses TLS over TCP. TLS connections
+        are driven with the standard library's memory BIO machinery rather
+        than an `ssl.SSLSocket`, so that all encrypted bytes are accounted
+        for explicitly: nothing can get stuck in hidden SSL-internal
+        buffers."""
+        self.tls_handshake_done: bool = False
+        """Indicates that the TLS handshake has completed successfully. No
+        diameter messages are processed or sent while this is False."""
+        self.tls_wait_read: bool = False
+        """While the TLS handshake is in progress, indicates that the TLS
+        layer is waiting for more encrypted bytes from the peer. Used to
+        avoid a busy select loop on permanently writable sockets."""
+        self.tls_wait_write: bool = False
+        """While the TLS handshake is in progress, indicates that the TLS
+        layer has produced encrypted bytes that must be sent to the peer."""
+        self.tls_handshake_started: float = time.time()
+        """Timestamp of when the connection, and thus its TLS handshake
+        attempt, was created. Used as a hard handshake deadline, since a
+        stalled peer may otherwise keep producing socket events forever."""
+        self.tls_in_bio: "ssl.MemoryBIO | None" = None
+        """Memory BIO receiving encrypted bytes read from the raw TCP
+        socket, consumed by the SSL object."""
+        self.tls_out_bio: "ssl.MemoryBIO | None" = None
+        """Memory BIO into which the SSL object writes encrypted bytes that
+        the node must send on the raw TCP socket."""
+        self.tls_object: "ssl.SSLObject | None" = None
+        """The SSL object performing handshake, decryption and encryption on
+        top of the memory BIOs."""
+        self.tls_out_pending: bytes = b""
+        """Encrypted bytes already pulled from `tls_out_bio` that the raw
+        socket could not accept yet (e.g. because of EAGAIN). These are sent
+        before any newly produced BIO data."""
         self.state: int = PEER_CLOSED
         """The current peer state, one of `PEER_*` constants. The peer will 
         go through a transition of CONNECTING - CONNECTED - READY and will not
